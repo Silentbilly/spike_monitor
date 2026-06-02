@@ -24,8 +24,9 @@ COPY tests/ ./tests/
 # Create data directories (SQLite DB + charts)
 RUN mkdir -p /app/data/charts && chown -R appuser:appuser /app/data
 
-# Matplotlib non-interactive backend (must be before any import)
+# Matplotlib non-interactive backend + writable config dir
 ENV MPLBACKEND=Agg
+ENV MPLCONFIGDIR=/tmp/matplotlib
 
 # Application configuration (override via .env or env vars)
 ENV PYTHONUNBUFFERED=1

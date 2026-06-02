@@ -30,8 +30,9 @@ def _make_engine(db_url: str) -> AsyncEngine:
 
     kwargs: dict = {}
     if "sqlite" in async_url:
-        kwargs["connect_args"] = {"check_same_thread": False}
-        kwargs["pool_size"] = 1        # SQLite is single-writer
+        # aiosqlite uses NullPool — pool_size and connect_args are not supported
+        from sqlalchemy.pool import NullPool
+        kwargs["poolclass"] = NullPool
 
     engine = create_async_engine(async_url, echo=False, **kwargs)
     logger.info("Database engine created: %s", async_url.split("?")[0])
