@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  spike_monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spike_monitor
+    restart: unless-stopped
+
+    # Mount .env for secrets
+    env_file:
+      - .env
+
+    # Persist SQLite database and charts between restarts
+    volumes:
+      - spike_data:/app/data
+
+    # Override to run a one-off CLI command:
+    # docker compose run --rm spike_monitor python -m app.cli full-scan
+    command: ["python", "-m", "app.main"]
+
+    # Optional resource limits (tune for your VPS)
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.config import get_config; get_config().validate(); print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  spike_data:
+    driver: local
