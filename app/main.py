@@ -79,7 +79,7 @@ class Application:
         """Get fresh session-bound repositories."""
         from app.storage.db import get_session_factory
         sf = get_session_factory()
-        session = await sf()
+        session = sf()  # async_sessionmaker.__call__ is not a coroutine
         spike_repo = SpikeEventRepository(session)
         watchlist_repo = WatchlistRepository(session)
         breakdown_repo = BreakdownRepository(session)
