@@ -227,6 +227,15 @@ class Config:
     )
     """Max bars to look back when searching for a ceiling base (default 120)."""
 
+    ibc_scan_timeframes: list[str] = field(
+        default_factory=lambda: [
+            tf.strip()
+            for tf in os.getenv("IBC_SCAN_TIMEFRAMES", "60,15").split(",")
+            if tf.strip()
+        ]
+    )
+    """Bybit interval strings to scan for IBC impulses (default: 60,15 = 1H and 15M)."""
+
     ibc_monitor_cron: str = field(
         default_factory=lambda: _get("IBC_MONITOR_CRON", "*/30 * * * *")
     )

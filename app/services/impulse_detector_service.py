@@ -23,15 +23,6 @@ from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
-# Timeframes scanned for IBC impulses
-IBC_SCAN_TIMEFRAMES: list[Timeframe] = [Timeframe.H1, Timeframe.M15]
-
-# Bybit interval strings for these timeframes
-_TF_INTERVAL: dict[Timeframe, str] = {
-    Timeframe.H1: "60",
-    Timeframe.M15: "15",
-}
-
 # Candle bars to fetch (must cover 20-bar baseline + impulse window + ATR14)
 _CANDLE_LIMIT = 60
 
@@ -74,7 +65,7 @@ class ImpulseDetectorService:
         tasks = [
             self._scan_symbol(instrument, tf, semaphore)
             for instrument in instruments
-            for tf in IBC_SCAN_TIMEFRAMES
+            for tf in self._cfg.ibc_scan_timeframes
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -100,7 +91,7 @@ class ImpulseDetectorService:
     async def _scan_symbol(
         self,
         instrument: InstrumentInfo,
-        tf: Timeframe,
+        tf: str,          # Bybit interval string e.g. "60", "15"
         semaphore: asyncio.Semaphore,
     ) -> Optional[ImpulseEvent]:
         async with semaphore:
@@ -110,7 +101,7 @@ class ImpulseDetectorService:
                 logger.debug(
                     "IBC scan failed for %s [%s]: %s",
                     instrument.symbol,
-                    tf.value,
+                    tf,
                     exc,
                 )
                 return None
@@ -130,7 +121,7 @@ class ImpulseDetectorService:
 
         for direction in (ImpulseDirection.UP, ImpulseDirection.DOWN):
             # Skip if already on watchlist for this symbol+tf+direction
-            already = await self._watchlist_repo.get_active_entry(symbol, tf.value, direction)
+            already = await self._watchlist_repo.get_active_entry(symbol, tf, direction)
             if already is not None:
                 continue
 
@@ -148,7 +139,7 @@ class ImpulseDetectorService:
 
             event = ImpulseEvent(
                 symbol=symbol,
-                timeframe=tf.value,
+                timeframe=tf,
                 direction=direction,
                 detected_at=utcnow(),
                 start_price=result.start_price,
@@ -192,7 +183,7 @@ class ImpulseDetectorService:
         logger.info(
             "IBC Impulse detected: %s [%s] %s %.1f%% (rv=%.2fx, ATR×=%.1f)",
             symbol,
-            tf.value,
+            tf,
             best_event.direction,
             best_event.move_pct,
             best_event.rv_impulse,
