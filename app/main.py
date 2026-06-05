@@ -2,6 +2,12 @@
 Application entry point.
 
 Wires all dependencies and starts the APScheduler event loop.
+
+ADDITIVE CHANGES:
+  - IBC repositories added to _get_repos() via _get_ibc_repos()
+  - Three new IBC job methods: run_ibc_impulse_scan(), run_ibc_base_monitor(),
+    run_ibc_breakout_check()
+  - register_ibc_jobs() called inside start()
 """
 
 from __future__ import annotations
@@ -14,17 +20,25 @@ from app.config import get_config
 from app.domain.enums import Timeframe
 from app.exchanges.bybit import BybitAdapter
 from app.logger import setup_logging
-from app.scheduler import build_scheduler, register_jobs
+from app.scheduler import build_scheduler, register_ibc_jobs, register_jobs
 from app.services.breakdown_service import BreakdownService
 from app.services.chart_service import ChartService
 from app.services.consolidation_service import ConsolidationService
 from app.services.health_service import HealthService
+from app.services.ibc_breakout_service import IBCBreakoutService
+from app.services.ibc_monitor_service import IBCMonitorService
+from app.services.impulse_detector_service import ImpulseDetectorService
 from app.services.notification_service import NotificationService
 from app.services.spike_detector_service import SpikeDetectorService
 from app.services.telegram_service import TelegramService
 from app.services.universe_service import UniverseService
 from app.services.watchlist_service import WatchlistService
 from app.storage.db import init_db
+from app.storage.ibc_repositories import (
+    IBCBreakoutRepository,
+    IBCWatchlistRepository,
+    ImpulseEventRepository,
+)
 from app.storage.repositories import (
     BreakdownRepository,
     HealthRepository,
@@ -62,30 +76,36 @@ class Application:
 
     def _init_repos(self):
         from app.storage.db import get_session_factory
-        sf = get_session_factory()
 
-        async def make_spike_repo():
-            return SpikeEventRepository(await sf())
-
-        # Use a simple factory pattern
-        self.spike_repo = None
-        self.watchlist_repo = None
-        self.breakdown_repo = None
-        self.notif_repo = None
-        self.health_repo = None
-        self._session_factory = sf
+        self._session_factory = get_session_factory()
 
     async def _get_repos(self):
-        """Get fresh session-bound repositories."""
+        """Get fresh session-bound repositories (existing spike pipeline)."""
         from app.storage.db import get_session_factory
+
         sf = get_session_factory()
-        session = sf()  # async_sessionmaker.__call__ is not a coroutine
+        session = sf()
         spike_repo = SpikeEventRepository(session)
         watchlist_repo = WatchlistRepository(session)
         breakdown_repo = BreakdownRepository(session)
         notif_repo = NotificationRepository(session)
         health_repo = HealthRepository(session)
         return spike_repo, watchlist_repo, breakdown_repo, notif_repo, health_repo, session
+
+    async def _get_ibc_repos(self):
+        """Get fresh session-bound IBC repositories."""
+        from app.storage.db import get_session_factory
+
+        sf = get_session_factory()
+        session = sf()
+        impulse_repo = ImpulseEventRepository(session)
+        ibc_watchlist_repo = IBCWatchlistRepository(session)
+        ibc_breakout_repo = IBCBreakoutRepository(session)
+        return impulse_repo, ibc_watchlist_repo, ibc_breakout_repo, session
+
+    # ------------------------------------------------------------------
+    # Existing spike-short pipeline jobs (unchanged)
+    # ------------------------------------------------------------------
 
     async def run_daily_scan(self) -> None:
         """Scan all instruments for daily spikes, notify and add to watchlist."""
@@ -105,7 +125,6 @@ class Application:
             for event in events:
                 await spike_repo.save(event)
 
-                # Generate chart
                 candles = await self.exchange.get_klines(
                     symbol=event.symbol, interval="D", limit=60
                 )
@@ -114,10 +133,8 @@ class Application:
                     event.chart_path = chart_path
                     await spike_repo.save(event)
 
-                # Notify
                 await notif_service.send_spike_candidate(event, chart_path)
 
-                # Add strong spikes to watchlist
                 if event.is_strong:
                     added, reason = await watchlist_service.add_if_eligible(event)
                     if added:
@@ -143,22 +160,16 @@ class Application:
                 self.exchange, watchlist_service, breakdown_repo, notif_repo, self.config
             )
 
-            # Expire stale items
             expired = await watchlist_service.expire_stale_items()
             for item in expired:
                 await notif_service.send_setup_expired(item)
 
-            # Consolidation scan
             await consolidation_service.scan_watchlist(timeframe)
 
-            # Breakdown scan
             signals = await breakdown_service.scan_for_breakdowns(timeframe)
             for signal in signals:
-                # Generate breakdown chart
                 candles = await self.exchange.get_klines(
-                    symbol=signal.symbol,
-                    interval=timeframe.value,
-                    limit=80,
+                    symbol=signal.symbol, interval=timeframe.value, limit=80
                 )
                 item_list = await watchlist_repo.get_by_symbol(signal.symbol)
                 item = item_list[0] if item_list else None
@@ -191,6 +202,75 @@ class Application:
         finally:
             await session.close()
 
+    # ------------------------------------------------------------------
+    # IBC pipeline jobs (additive)
+    # ------------------------------------------------------------------
+
+    async def run_ibc_impulse_scan(self) -> None:
+        """Phase 1: Full-universe impulse scan on 1H and 15M timeframes."""
+        logger.info("=== IBC Phase 1: Impulse Scan ===")
+        ibc_repos = await self._get_ibc_repos()
+        impulse_repo, ibc_watchlist_repo, ibc_breakout_repo, session = ibc_repos
+        try:
+            universe_service = UniverseService(self.exchange, self.config)
+            instruments = await universe_service.get_tradeable_universe()
+
+            detector = ImpulseDetectorService(
+                exchange=self.exchange,
+                impulse_repo=impulse_repo,
+                watchlist_repo=ibc_watchlist_repo,
+                config=self.config,
+            )
+            events = await detector.scan_universe(instruments)
+            logger.info("IBC impulse scan complete: %d new impulse events", len(events))
+        except Exception as exc:
+            logger.error("IBC impulse scan error: %s", exc, exc_info=True)
+        finally:
+            await session.close()
+
+    async def run_ibc_base_monitor(self) -> None:
+        """Phase 2: Base/level formation monitor. Sends 'Base Formed' alerts."""
+        logger.info("=== IBC Phase 2: Base Monitor ===")
+        ibc_repos = await self._get_ibc_repos()
+        impulse_repo, ibc_watchlist_repo, ibc_breakout_repo, session = ibc_repos
+        try:
+            monitor = IBCMonitorService(
+                exchange=self.exchange,
+                watchlist_repo=ibc_watchlist_repo,
+                telegram=self.telegram,
+                config=self.config,
+            )
+            confirmed = await monitor.run_monitor_cycle()
+            logger.info("IBC base monitor: %d base(s) confirmed", len(confirmed))
+        except Exception as exc:
+            logger.error("IBC base monitor error: %s", exc, exc_info=True)
+        finally:
+            await session.close()
+
+    async def run_ibc_breakout_check(self) -> None:
+        """Phase 3: Breakout detection for base-confirmed entries."""
+        logger.info("=== IBC Phase 3: Breakout Check ===")
+        ibc_repos = await self._get_ibc_repos()
+        impulse_repo, ibc_watchlist_repo, ibc_breakout_repo, session = ibc_repos
+        try:
+            breakout_svc = IBCBreakoutService(
+                exchange=self.exchange,
+                watchlist_repo=ibc_watchlist_repo,
+                breakout_repo=ibc_breakout_repo,
+                telegram=self.telegram,
+                config=self.config,
+            )
+            events = await breakout_svc.run_breakout_cycle()
+            logger.info("IBC breakout check: %d breakout(s) triggered", len(events))
+        except Exception as exc:
+            logger.error("IBC breakout check error: %s", exc, exc_info=True)
+        finally:
+            await session.close()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     async def start(self) -> None:
         """Initialise DB, register jobs, start scheduler."""
         setup_logging(self.config.log_level, self.config.log_json)
@@ -198,12 +278,23 @@ class Application:
         self._init_repos()
 
         scheduler = build_scheduler(self.config)
+
+        # Existing spike-short pipeline
         register_jobs(
             scheduler,
             daily_scan_fn=self.run_daily_scan,
             watchlist_4h_fn=lambda: self.run_watchlist_scan(Timeframe.H4),
             watchlist_1h_fn=lambda: self.run_watchlist_scan(Timeframe.H1),
             health_fn=self.run_health_ping,
+            config=self.config,
+        )
+
+        # IBC pipeline (additive)
+        register_ibc_jobs(
+            scheduler,
+            ibc_impulse_fn=self.run_ibc_impulse_scan,
+            ibc_monitor_fn=self.run_ibc_base_monitor,
+            ibc_breakout_fn=self.run_ibc_breakout_check,
             config=self.config,
         )
 
@@ -221,7 +312,7 @@ class Application:
         logger.info("SpikeMonitor started. Scheduler running. Press Ctrl+C to stop.")
 
         try:
-            await asyncio.Event().wait()  # run forever
+            await asyncio.Event().wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:

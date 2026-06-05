@@ -1,7 +1,7 @@
 """
 CLI entry point using Typer.
 
-Available commands:
+Available commands (existing):
   full-scan           — Run universe fetch + daily spike scan once
   daily-scan          — Run daily spike scan (single run)
   watchlist-scan-4h   — Run 4H watchlist scan once
@@ -10,6 +10,11 @@ Available commands:
   healthcheck         — Run health check and print results
   list-watchlist      — Print active watchlist to stdout
   cleanup-expired     — Remove terminal items from DB
+
+ADDITIVE IBC commands:
+  ibc-scan            — Run IBC Phase 1 impulse scan once
+  list-ibc-watchlist  — Print IBC watchlist entries
+  list-ibc-breakouts  — Print recent IBC breakout events
 """
 
 from __future__ import annotations
@@ -62,6 +67,11 @@ async def _get_application():
     app_instance.chart = ChartService(config)
     app_instance._init_repos()
     return app_instance
+
+
+# ===========================================================================
+# Existing commands (unchanged)
+# ===========================================================================
 
 
 @app.command("full-scan")
@@ -163,7 +173,7 @@ def healthcheck():
 
 @app.command("list-watchlist")
 def list_watchlist():
-    """Print all active watchlist items."""
+    """Print all active spike-short watchlist items."""
     async def _run_inner():
         application = await _get_application()
         repos = await application._get_repos()
@@ -173,7 +183,10 @@ def list_watchlist():
             if not items:
                 typer.echo("Watchlist is empty.")
                 return
-            typer.echo(f"\n{'Symbol':<15} {'Status':<20} {'Score':>6} {'Spike%':>8} {'Retrace%':>9} {'Added'}")
+            typer.echo(
+                f"\n{'Symbol':<15} {'Status':<20} {'Score':>6} {'Spike%':>8} "
+                f"{'Retrace%':>9} {'Added'}"
+            )
             typer.echo("-" * 75)
             for item in items:
                 typer.echo(
@@ -199,6 +212,99 @@ def cleanup_expired():
             svc = WatchlistService(watchlist_repo, notif_repo, application.config)
             deleted = await svc.cleanup_terminal()
             typer.echo(f"Cleaned up {deleted} terminal items.")
+        finally:
+            await session.close()
+            await application.exchange.close()
+    _run(_run_inner())
+
+
+# ===========================================================================
+# IBC commands (additive)
+# ===========================================================================
+
+
+@app.command("ibc-scan")
+def ibc_scan():
+    """Run IBC Phase 1 impulse scan across the full universe (once)."""
+    async def _run_inner():
+        application = await _get_application()
+        try:
+            await application.run_ibc_impulse_scan()
+        finally:
+            await application.exchange.close()
+            await application.telegram.close()
+    _run(_run_inner())
+    typer.echo("IBC impulse scan complete.")
+
+
+@app.command("list-ibc-watchlist")
+def list_ibc_watchlist(
+    status: str = typer.Option("", help="Filter by status (e.g. impulse_detected, base_confirmed)"),
+    limit: int = typer.Option(50, help="Max rows to display"),
+):
+    """Print IBC watchlist entries."""
+    async def _run_inner():
+        application = await _get_application()
+        ibc_repos = await application._get_ibc_repos()
+        _, ibc_watchlist_repo, _, session = ibc_repos
+        try:
+            entries = await ibc_watchlist_repo.get_all(limit=limit)
+            if status:
+                entries = [e for e in entries if e.status == status]
+            if not entries:
+                typer.echo("No IBC watchlist entries found.")
+                return
+            typer.echo(
+                f"\n{'Symbol':<16} {'TF':<6} {'Dir':<6} {'Status':<22} "
+                f"{'Impulse%':>9} {'Level':>12} {'Touches':>8} {'Added'}"
+            )
+            typer.echo("-" * 100)
+            for e in entries:
+                dir_str = e.direction if isinstance(e.direction, str) else e.direction.value
+                status_str = e.status if isinstance(e.status, str) else e.status.value
+                level_str = f"{e.level_price:.4f}" if e.level_price else "—"
+                touches_str = str(e.level_touches) if e.level_touches else "—"
+                typer.echo(
+                    f"{e.symbol:<16} {e.timeframe:<6} {dir_str.upper():<6} "
+                    f"{status_str:<22} {e.impulse_move_pct:>+9.1f}% "
+                    f"{level_str:>12} {touches_str:>8}  "
+                    f"{e.added_at.strftime('%Y-%m-%d %H:%M')}"
+                )
+        finally:
+            await session.close()
+            await application.exchange.close()
+    _run(_run_inner())
+
+
+@app.command("list-ibc-breakouts")
+def list_ibc_breakouts(
+    hours: int = typer.Option(48, help="Look back N hours"),
+):
+    """Print recent IBC breakout events."""
+    async def _run_inner():
+        application = await _get_application()
+        ibc_repos = await application._get_ibc_repos()
+        _, _, ibc_breakout_repo, session = ibc_repos
+        try:
+            events = await ibc_breakout_repo.get_recent(hours=hours)
+            if not events:
+                typer.echo(f"No IBC breakouts in the last {hours}h.")
+                return
+            typer.echo(
+                f"\n{'Symbol':<16} {'TF':<6} {'Dir':<6} {'Score':>6} "
+                f"{'BrkPrice':>12} {'Level':>12} {'Dist%':>7} {'Vol':>5} {'Triggered'}"
+            )
+            typer.echo("-" * 100)
+            for e in events:
+                dir_str = e.direction if isinstance(e.direction, str) else e.direction.value
+                vol_str = "✓" if e.volume_confirmed else "✗"
+                typer.echo(
+                    f"{e.symbol:<16} {e.timeframe:<6} {dir_str.upper():<6} "
+                    f"{e.score:>6.0f} {e.breakout_price:>12.4f} "
+                    f"{e.level_price:>12.4f} {e.distance_pct:>+7.2f}% "
+                    f"{vol_str:>5}  "
+                    f"{e.triggered_at.strftime('%Y-%m-%d %H:%M')}"
+                )
         finally:
             await session.close()
             await application.exchange.close()
