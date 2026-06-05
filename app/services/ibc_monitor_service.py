@@ -30,9 +30,8 @@ import pandas as pd
 from app.config import Config
 from app.domain.enums import Timeframe
 from app.domain.ibc_models import IBCStatus, IBCWatchlistEntry, ImpulseDirection
-from app.domain.ibc_rules import evaluate_level
+from app.domain.ibc_rules import CeilingBaseResult, evaluate_ceiling_base
 from app.domain.models import OHLCV
-from app.domain.rules import evaluate_consolidation
 from app.exchanges.bybit import BybitAdapter
 from app.services.telegram_service import TelegramService
 from app.storage.ibc_repositories import IBCWatchlistRepository
@@ -115,7 +114,12 @@ class IBCMonitorService:
         self, entry: IBCWatchlistEntry
     ) -> Optional[IBCWatchlistEntry]:
         """
-        Check if a base has formed for the given watchlist entry.
+        Check if a ceiling base has formed for the given watchlist entry.
+
+        Uses evaluate_ceiling_base() which detects a flat resistance/support
+        level by clustering bar highs (UP) or lows (DOWN), rather than gating
+        on the total height of the consolidation zone.  This correctly handles
+        wide-range bases that still have a clearly defined ceiling.
 
         Returns the updated entry if base confirmed, else None.
         """
@@ -131,135 +135,89 @@ class IBCMonitorService:
 
         direction = ImpulseDirection(entry.direction)
 
-        # Post-impulse candles: everything after the impulse end price formation
-        # We take all candles but the last N (conservatively use all for level detection)
-        post_impulse = candles  # level detection works on the full window
+        # Post-impulse bars: look back up to ibc_ceiling_max_age_bars
+        lookback = min(len(candles), self._cfg.ibc_ceiling_max_age_bars)
+        post_impulse = candles[-lookback:]
 
-        # ── 1. Level detection ─────────────────────────────────────────
-        level_result = evaluate_level(
-            candles=post_impulse,
+        # Reconstruct impulse avg volume from stored rv and oldest available baseline.
+        # rv = avg_impulse_vol / avg_20_vol  →  avg_impulse_vol = rv × avg_20_vol.
+        baseline_slice = candles[: max(1, len(candles) - lookback)]
+        avg_20_vol = (
+            sum(c.volume for c in baseline_slice[-20:]) / min(20, len(baseline_slice))
+            if baseline_slice
+            else 1.0
+        )
+        impulse_avg_vol = entry.impulse_rv * avg_20_vol
+
+        # ── Ceiling base detection ──────────────────────────────────────────
+        ceiling: CeilingBaseResult = evaluate_ceiling_base(
+            bars=post_impulse,
             direction=direction,
-            cluster_pct=self._cfg.ibc_level_cluster_pct,
-            min_touches=self._cfg.ibc_level_min_touches,
-            max_age_bars=self._cfg.ibc_level_max_age_bars,
+            impulse_avg_volume=impulse_avg_vol,
+            cluster_tol_pct=self._cfg.ibc_ceiling_cluster_tol_pct,
+            min_touches=self._cfg.ibc_ceiling_min_touches,
+            min_flat_ratio=self._cfg.ibc_ceiling_min_flat_ratio,
+            vol_decay_thresh=self._cfg.ibc_base_volume_decay,
         )
 
-        if not level_result.detected:
+        if not ceiling.detected:
             logger.debug(
-                "IBC [%s %s %s] level not found: %s",
+                "IBC [%s %s %s] ceiling base not found: %s",
                 entry.symbol, entry.timeframe, direction.value,
-                level_result.reason,
+                ceiling.reason,
             )
             return None
 
-        # ── 2. Consolidation detection ──────────────────────────────────
-        lookback_bars = min(len(candles), self._cfg.ibc_level_max_age_bars)
-        cons_candles = candles[-lookback_bars:]
-
-        cons_result = evaluate_consolidation(
-            candles=cons_candles,
-            min_bars=self._cfg.consolidation_min_bars,
-            max_bars=min(lookback_bars, self._cfg.consolidation_max_bars),
-            max_range_pct=self._cfg.ibc_base_max_range_pct,
-            contraction_threshold=self._cfg.consolidation_contraction_threshold,
+        # ── All conditions met — update entry ───────────────────────────────
+        entry.level_price   = ceiling.ceiling_price
+        entry.level_touches = ceiling.touches
+        # Ceiling corridor bounds
+        tol = self._cfg.ibc_ceiling_cluster_tol_pct / 100.0
+        entry.level_cluster_high = ceiling.ceiling_price * (1.0 + tol)
+        entry.level_cluster_low  = ceiling.ceiling_price * (1.0 - tol)
+        # base_range_pct repurposed as flatness quality %
+        entry.base_range_pct    = round(ceiling.flatness_pct, 2)
+        entry.base_candle_count = ceiling.total_bars
+        entry.base_avg_volume   = (
+            sum(c.volume for c in post_impulse) / len(post_impulse)
+            if post_impulse else 0.0
         )
-
-        if not cons_result.detected:
-            logger.debug(
-                "IBC [%s %s %s] consolidation not found: %s",
-                entry.symbol, entry.timeframe, direction.value,
-                cons_result.reason,
-            )
-            return None
-
-        # ── 3. Volume decay check ────────────────────────────────────────
-        base_avg_vol = (
-            sum(c.volume for c in cons_candles) / len(cons_candles)
-            if cons_candles
-            else 0.0
-        )
-        impulse_avg_vol = entry.impulse_rv * (
-            entry.impulse_end_price  # proxy; actual impulse avg stored in DB
-        )
-        # Use the stored impulse avg volume directly
-        impulse_ref_vol = entry.impulse_rv  # rv = base_avg / 20_avg, we'll compute decay vs impulse
-        # Volume decay: base avg vol / impulse avg vol (we stored rv = imp_avg/20_avg)
-        # To get decay we compare base_avg_vol vs the avg_20_volume baseline
-        # We use: decay = base_avg_vol / (entry.impulse_rv * avg_20_baseline)
-        # But avg_20_baseline is not stored; estimate as base_avg_vol / entry.impulse_rv
-        # Simplest correct approach: use candle volumes directly
-        # impulse bars volume is not easily available after the fact, so use rv as proxy:
-        # decay = base_avg_vol / (entry.impulse_rv * estimated_20_avg)
-        # estimated_20_avg = base_avg_vol / entry.impulse_rv (circular) → use absolute check
-        # Instead: volume_decay = base_avg_vol / (base_avg_vol + 1) is meaningless
-        # Best approach: store impulse avg_volume in the watchlist entry
-        # IBCWatchlistEntry doesn't have it directly — but ImpulseEvent does.
-        # For the phase-2 check we compute volume_decay as a rough heuristic using
-        # the impulse rv field: expected_impulse_vol ≈ base_avg_vol / max(entry.impulse_rv, 0.1)
-        # Rehydrate from the impulse event if possible; otherwise use threshold ratio.
-        # For correctness, we stored impulse_rv = avg_impulse_vol / avg_20_vol,
-        # and we can estimate: avg_20_vol ≈ base_avg_vol / entry.impulse_rv  (if base decayed to ~1×)
-        # This is an approximation. For a clean signal check we compare base_avg_vol to
-        # the 20-bar average of the candles currently loaded.
-        recent_20_avg = (
-            sum(c.volume for c in candles[-20:]) / 20 if len(candles) >= 20 else base_avg_vol
-        )
-        volume_decay = base_avg_vol / recent_20_avg if recent_20_avg > 0 else 1.0
-
-        if volume_decay > self._cfg.ibc_base_volume_decay:
-            logger.debug(
-                "IBC [%s %s] volume decay insufficient: %.2f > %.2f",
-                entry.symbol, entry.timeframe, volume_decay, self._cfg.ibc_base_volume_decay,
-            )
-            return None
-
-        # ── 4. All conditions met — update entry ────────────────────────
-        entry.level_price = level_result.level_price
-        entry.level_touches = level_result.touches
-        entry.level_cluster_high = level_result.cluster_high
-        entry.level_cluster_low = level_result.cluster_low
-        entry.base_range_pct = cons_result.range_pct
-        entry.base_candle_count = cons_result.candle_count
-        entry.base_avg_volume = base_avg_vol
-        entry.status = IBCStatus.BASE_CONFIRMED
+        entry.ceiling_flat_ratio = ceiling.flat_ratio
+        entry.ceiling_vol_decay  = ceiling.vol_decay
+        entry.status          = IBCStatus.BASE_CONFIRMED
         entry.base_alert_sent = True
         entry.last_checked_at = utcnow()
         await self._watchlist_repo.save(entry)
 
-        # ── 5. Generate chart and send Telegram alert ────────────────────
-        chart_path = self._render_base_chart(entry, candles, level_result.level_price, cons_result)
+        # ── Generate chart and send Telegram alert ──────────────────────────
+        chart_path = self._render_base_chart(entry, candles, ceiling)
         await self._send_base_alert(entry, chart_path)
 
         logger.info(
-            "IBC Base confirmed: %s [%s] %s | level=%.4f (%d touches) | range=%.1f%%",
-            entry.symbol,
-            entry.timeframe,
-            entry.direction,
-            entry.level_price,
-            entry.level_touches,
-            entry.base_range_pct,
+            "IBC Ceiling base confirmed: %s [%s] %s | "
+            "ceiling=%.4f (%d touches, %.1f%% of bars) | flatness=%.2f%%",
+            entry.symbol, entry.timeframe, entry.direction,
+            entry.level_price, entry.level_touches,
+            ceiling.flat_ratio * 100.0, ceiling.flatness_pct,
         )
         return entry
 
-    # ------------------------------------------------------------------
-    # Chart rendering
     # ------------------------------------------------------------------
 
     def _render_base_chart(
         self,
         entry: IBCWatchlistEntry,
         candles: list[OHLCV],
-        level_price: float,
-        cons_result,
+        ceiling: CeilingBaseResult,
     ) -> Optional[str]:
-        """Render a base-formation chart annotated with level and base zone."""
+        """Render chart annotated with the detected flat ceiling level."""
         try:
             display = candles[-60:]
             data = {
-                "Open": [c.open for c in display],
-                "High": [c.high for c in display],
-                "Low": [c.low for c in display],
-                "Close": [c.close for c in display],
+                "Open":   [c.open   for c in display],
+                "High":   [c.high   for c in display],
+                "Low":    [c.low    for c in display],
+                "Close":  [c.close  for c in display],
                 "Volume": [c.volume for c in display],
             }
             index = pd.DatetimeIndex([c.timestamp for c in display], name="Date")
@@ -286,7 +244,10 @@ class IBCMonitorService:
                 },
             )
 
-            direction_str = entry.direction if isinstance(entry.direction, str) else entry.direction.value
+            direction_str = (
+                entry.direction if isinstance(entry.direction, str) else entry.direction.value
+            )
+            tol = self._cfg.ibc_ceiling_cluster_tol_pct / 100.0
 
             fig, axes = mpf.plot(
                 df,
@@ -295,37 +256,32 @@ class IBCMonitorService:
                 volume=True,
                 figsize=(14, 8),
                 title=(
-                    f"\n{entry.symbol}  |  IBC Base Formed [{entry.timeframe}]  "
+                    f"\n{entry.symbol}  |  IBC Ceiling Base [{entry.timeframe}]  "
                     f"|  {direction_str.upper()}"
                 ),
                 hlines=dict(
-                    hlines=[level_price],
+                    hlines=[ceiling.ceiling_price],
                     colors=["#f39c12"],
                     linestyle=["--"],
-                    linewidths=[1.5],
+                    linewidths=[1.8],
                 ),
                 returnfig=True,
             )
             ax = axes[0]
 
-            # Shade consolidation (base) zone
+            # Shade ceiling cluster band
             ax.axhspan(
-                cons_result.range_low,
-                cons_result.range_high,
-                alpha=0.15,
-                color="#3498db",
-                label="Base zone",
+                ceiling.ceiling_price * (1.0 - tol),
+                ceiling.ceiling_price * (1.0 + tol),
+                alpha=0.18,
+                color="#f39c12",
+                label="Ceiling cluster band",
             )
 
-            # Highlight impulse candles (approximate: first N bars from bottom)
-            # Colour the latest `impulse_bar_count` bars
-            imp_count = 0  # stored in watchlist entry via impulse event — approximate with 1-5
-            # We don't store bar_count in watchlist entry, but ImpulseEvent has it.
-            # For visual clarity, just shade the whole chart and mark with text.
-
             ax.annotate(
-                f"Level: {level_price:.4f}  ({entry.level_touches} touches)",
-                xy=(df.index[-1], level_price),
+                f"Ceiling: {ceiling.ceiling_price:.4f}  "
+                f"({ceiling.touches} touches, {ceiling.flat_ratio * 100:.1f}% of bars)",
+                xy=(df.index[-1], ceiling.ceiling_price),
                 xytext=(5, 8),
                 textcoords="offset points",
                 color="#f39c12",
@@ -335,8 +291,10 @@ class IBCMonitorService:
 
             stats = (
                 f"Impulse: {entry.impulse_move_pct:+.1f}%  [{direction_str.upper()}]\n"
-                f"Level touches: {entry.level_touches}\n"
-                f"Base range: {entry.base_range_pct:.1f}%"
+                f"Ceiling: {ceiling.ceiling_price:.4f}  ({ceiling.touches} touches)\n"
+                f"Flat ratio: {ceiling.flat_ratio * 100:.1f}%  "
+                f"flatness={ceiling.flatness_pct:.2f}%\n"
+                f"Vol decay: {ceiling.vol_decay:.3f}x"
             )
             ax.text(
                 0.02, 0.97, stats,
@@ -353,21 +311,20 @@ class IBCMonitorService:
             )
 
             ts = utcnow().strftime("%Y%m%d_%H%M%S")
-            fname = f"{entry.symbol}_ibc_base_{ts}.png"
+            fname = f"{entry.symbol}_ibc_ceiling_{ts}.png"
             output = os.path.join(self._cfg.chart_output_dir, fname)
-            fig.savefig(output, dpi=self._cfg.chart_dpi, bbox_inches="tight", facecolor="#1a1a2e")
+            fig.savefig(
+                output, dpi=self._cfg.chart_dpi, bbox_inches="tight", facecolor="#1a1a2e"
+            )
             plt.close(fig)
             return output
 
         except Exception as exc:
             logger.error(
-                "IBC base chart render failed for %s: %s", entry.symbol, exc, exc_info=True
+                "IBC ceiling chart render failed for %s: %s", entry.symbol, exc, exc_info=True
             )
             return None
 
-    # ------------------------------------------------------------------
-    # Telegram alert
-    # ------------------------------------------------------------------
 
     async def _send_base_alert(
         self, entry: IBCWatchlistEntry, chart_path: Optional[str]

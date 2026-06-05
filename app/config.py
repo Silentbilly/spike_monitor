@@ -206,6 +206,27 @@ class Config:
     )
     """Maximum ratio of base avg volume / impulse avg volume (default 0.6)."""
 
+    # ---- Phase 2 ceiling detection ----------------------------------
+    ibc_ceiling_cluster_tol_pct: float = field(
+        default_factory=lambda: _get_float("IBC_CEILING_CLUSTER_TOL_PCT", 2.0)
+    )
+    """Tolerance % for grouping highs/lows into the same ceiling cluster (default 2.0%)."""
+
+    ibc_ceiling_min_touches: int = field(
+        default_factory=lambda: _get_int("IBC_CEILING_MIN_TOUCHES", 8)
+    )
+    """Minimum bar highs/lows that must touch the ceiling cluster (default 8)."""
+
+    ibc_ceiling_min_flat_ratio: float = field(
+        default_factory=lambda: _get_float("IBC_CEILING_MIN_FLAT_RATIO", 0.25)
+    )
+    """Minimum fraction of base bars that must touch the ceiling (default 0.25)."""
+
+    ibc_ceiling_max_age_bars: int = field(
+        default_factory=lambda: _get_int("IBC_CEILING_MAX_AGE_BARS", 120)
+    )
+    """Max bars to look back when searching for a ceiling base (default 120)."""
+
     ibc_monitor_cron: str = field(
         default_factory=lambda: _get("IBC_MONITOR_CRON", "*/30 * * * *")
     )
