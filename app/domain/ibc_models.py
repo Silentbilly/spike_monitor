@@ -149,9 +149,11 @@ class IBCWatchlistEntry(BaseModel):
     level_cluster_low: Optional[float] = None
 
     # Consolidation (populated when base is confirmed)
-    base_range_pct: Optional[float] = None
+    base_range_pct: Optional[float] = None       # flatness % (std/ceiling) for ceiling bases
     base_candle_count: Optional[int] = None
     base_avg_volume: Optional[float] = None
+    ceiling_flat_ratio: Optional[float] = None   # fraction of bars touching ceiling (0–1)
+    ceiling_vol_decay: Optional[float] = None    # base avg vol / impulse avg vol
 
     # Breakout tracking
     breakout_price: Optional[float] = None

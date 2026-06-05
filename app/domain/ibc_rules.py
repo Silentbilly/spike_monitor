@@ -12,6 +12,8 @@ import statistics
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
+
 from app.domain.ibc_models import (
     IBCBreakoutResult,
     ImpulseDirection,
@@ -278,6 +280,169 @@ def evaluate_level(
         reason=(
             f"Level at {level_price:.4f} ({touches} touches, "
             f"corridor {cluster_low:.4f}–{cluster_high:.4f})"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b — Ceiling-based base detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CeilingBaseResult:
+    """
+    Output of evaluate_ceiling_base().
+
+    Replaces the range-based consolidation check with a flat-ceiling
+    clustering check: the base is valid when a statistically flat
+    resistance (UP) or support (DOWN) line is formed by repeated high/low
+    touches, regardless of the total height of the zone.
+    """
+
+    detected: bool
+    ceiling_price: float        # representative resistance / support level
+    touches: int                # bars whose high/low reached the ceiling
+    flat_ratio: float           # touches / total_bars  (0–1)
+    flatness_pct: float         # std(touches) / ceiling × 100  — quality metric
+    vol_decay: float            # base avg vol / impulse avg vol
+    total_bars: int
+    reason: str
+
+
+def evaluate_ceiling_base(
+    bars: list[OHLCV],
+    direction: ImpulseDirection,
+    impulse_avg_volume: float,
+    cluster_tol_pct: float = 2.0,
+    min_touches: int = 8,
+    min_flat_ratio: float = 0.25,
+    vol_decay_thresh: float = 0.60,
+) -> CeilingBaseResult:
+    """
+    Detect a flat ceiling (resistance for UP, support for DOWN) via high/low
+    clustering.  This is the replacement for the range-width gate in Phase 2.
+
+    Unlike the legacy `evaluate_level` + `evaluate_consolidation` combination
+    that fails when the *overall* zone height is wide (e.g. due to a single
+    spike wick), this function only asks: "are the *tops* (or *bottoms*)
+    of the base bars converging on the same level?"
+
+    Algorithm
+    ---------
+    1. Collect highs (UP) or lows (DOWN) of every bar.
+    2. Greedy-cluster them with ``cluster_tol_pct`` tolerance.
+    3. Pick the dominant cluster (most members).
+    4. Validate:
+       - touches   >= ``min_touches``
+       - flat_ratio  = touches / len(bars)  >= ``min_flat_ratio``
+       - vol_decay = base avg vol / impulse avg vol  < ``vol_decay_thresh``
+
+    Args:
+        bars:               Post-impulse OHLCV bars (oldest-first).
+        direction:          ImpulseDirection.UP or DOWN.
+        impulse_avg_volume: Average volume of the impulse bars (from Phase 1).
+        cluster_tol_pct:    Highs/lows within ±this% of cluster centre are
+                            grouped together.  Env: IBC_CEILING_CLUSTER_TOL_PCT.
+        min_touches:        Minimum bars touching the ceiling cluster.
+                            Env: IBC_CEILING_MIN_TOUCHES.
+        min_flat_ratio:     Minimum fraction (0–1) of base bars that must touch
+                            the ceiling.  Env: IBC_CEILING_MIN_FLAT_RATIO.
+        vol_decay_thresh:   Maximum allowed ratio of base avg vol / impulse avg
+                            vol.  Env: IBC_BASE_VOLUME_DECAY (shared key).
+
+    Returns:
+        CeilingBaseResult with detected=True when all conditions pass.
+    """
+    _no = CeilingBaseResult(
+        detected=False,
+        ceiling_price=0.0,
+        touches=0,
+        flat_ratio=0.0,
+        flatness_pct=0.0,
+        vol_decay=0.0,
+        total_bars=len(bars),
+        reason="",
+    )
+
+    if len(bars) < min_touches:
+        _no.reason = f"Insufficient bars: {len(bars)} < {min_touches}"
+        return _no
+
+    # ── 1. Collect extremes ────────────────────────────────────────────────
+    extremes: list[float]
+    if direction == ImpulseDirection.UP:
+        extremes = [b.high for b in bars]
+    else:
+        extremes = [b.low for b in bars]
+
+    # ── 2. Greedy clustering ───────────────────────────────────────────────
+    clusters: dict[float, list[float]] = {}   # centre → members
+    for price in extremes:
+        placed = False
+        for centre in list(clusters.keys()):
+            if abs(price - centre) / centre * 100.0 <= cluster_tol_pct:
+                clusters[centre].append(price)
+                placed = True
+                break
+        if not placed:
+            clusters[price] = [price]
+
+    if not clusters:
+        _no.reason = "No price clusters found"
+        return _no
+
+    # ── 3. Dominant cluster ────────────────────────────────────────────────
+    best_centre, best_members = max(clusters.items(), key=lambda kv: len(kv[1]))
+    touches = len(best_members)
+
+    # ── 4. Minimum touches ────────────────────────────────────────────────
+    if touches < min_touches:
+        _no.reason = (
+            f"Dominant cluster has {touches} touches "
+            f"(required {min_touches})"
+        )
+        return _no
+
+    # ── 5. Flat ratio ─────────────────────────────────────────────────────
+    flat_ratio = touches / len(bars)
+    if flat_ratio < min_flat_ratio:
+        _no.reason = (
+            f"Flat ratio {flat_ratio:.2f} < {min_flat_ratio} "
+            f"({touches}/{len(bars)} bars touch ceiling)"
+        )
+        return _no
+
+    # ── 6. Flatness quality ────────────────────────────────────────────────
+    arr = np.array(best_members, dtype=float)
+    ceiling_price = float(arr.mean())
+    flatness_pct = float(arr.std() / ceiling_price * 100.0) if ceiling_price > 0 else 0.0
+
+    # ── 7. Volume decay ────────────────────────────────────────────────────
+    base_avg_vol = sum(b.volume for b in bars) / len(bars) if bars else 0.0
+    vol_decay = (
+        base_avg_vol / impulse_avg_volume if impulse_avg_volume > 0 else 1.0
+    )
+    if vol_decay > vol_decay_thresh:
+        _no.reason = (
+            f"Volume decay {vol_decay:.3f} > threshold {vol_decay_thresh} "
+            f"(base_avg={base_avg_vol:.0f}, impulse_avg={impulse_avg_volume:.0f})"
+        )
+        return _no
+
+    return CeilingBaseResult(
+        detected=True,
+        ceiling_price=ceiling_price,
+        touches=touches,
+        flat_ratio=flat_ratio,
+        flatness_pct=flatness_pct,
+        vol_decay=vol_decay,
+        total_bars=len(bars),
+        reason=(
+            f"Ceiling at {ceiling_price:.4f} | "
+            f"{touches} touches ({flat_ratio*100:.1f}% of bars) | "
+            f"flatness={flatness_pct:.2f}% | "
+            f"vol_decay={vol_decay:.3f}x"
         ),
     )
 
