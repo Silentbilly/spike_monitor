@@ -2,6 +2,13 @@
 Application configuration loaded from environment variables / .env file.
 
 All thresholds are configurable — change values in .env without touching code.
+
+ADDITIVE CHANGES (IBC_* keys appended at the bottom):
+  IBC impulse detection thresholds
+  IBC level / base thresholds
+  IBC breakout thresholds
+  IBC scheduler intervals
+  IBC cooldown / TTL
 """
 
 from __future__ import annotations
@@ -141,6 +148,95 @@ class Config:
     # ----------------------------------------------------------------
     enable_funding_enrichment: bool = field(default_factory=lambda: _get_bool("ENABLE_FUNDING_ENRICHMENT", True))
     enable_oi_enrichment: bool = field(default_factory=lambda: _get_bool("ENABLE_OI_ENRICHMENT", False))
+
+    # ================================================================
+    # IBC (Impulse → Base → Continuation) configuration
+    # All keys prefixed IBC_
+    # ================================================================
+
+    # ---- Phase 1: Impulse detection --------------------------------
+    ibc_impulse_min_pct: float = field(
+        default_factory=lambda: _get_float("IBC_IMPULSE_MIN_PCT", 15.0)
+    )
+    """Minimum % move to qualify as an impulse (default 15%)."""
+
+    ibc_impulse_max_bars: int = field(
+        default_factory=lambda: _get_int("IBC_IMPULSE_MAX_BARS", 5)
+    )
+    """Maximum consecutive bars for an impulse window (default 5)."""
+
+    ibc_impulse_rv_min: float = field(
+        default_factory=lambda: _get_float("IBC_IMPULSE_RV_MIN", 1.5)
+    )
+    """Minimum relative volume (impulse avg / 20-bar avg) for impulse (default 1.5×)."""
+
+    ibc_impulse_atr_min: float = field(
+        default_factory=lambda: _get_float("IBC_IMPULSE_ATR_MIN", 3.0)
+    )
+    """Minimum ATR multiple for impulse move (default 3.0×)."""
+
+    ibc_impulse_scan_cron: str = field(
+        default_factory=lambda: _get("IBC_IMPULSE_SCAN_CRON", "0 */4 * * *")
+    )
+    """Cron for Phase 1 full-universe scan (default every 4 hours)."""
+
+    # ---- Phase 2: Level / Base detection ---------------------------
+    ibc_level_cluster_pct: float = field(
+        default_factory=lambda: _get_float("IBC_LEVEL_CLUSTER_PCT", 1.0)
+    )
+    """±% corridor for clustering extremes into a level (default 1.0%)."""
+
+    ibc_level_min_touches: int = field(
+        default_factory=lambda: _get_int("IBC_LEVEL_MIN_TOUCHES", 2)
+    )
+    """Minimum extreme touches to validate a level (default 2)."""
+
+    ibc_level_max_age_bars: int = field(
+        default_factory=lambda: _get_int("IBC_LEVEL_MAX_AGE_BARS", 30)
+    )
+    """Maximum bar age for a level to remain valid (default 30 bars)."""
+
+    ibc_base_max_range_pct: float = field(
+        default_factory=lambda: _get_float("IBC_BASE_MAX_RANGE_PCT", 10.0)
+    )
+    """Maximum consolidation range % for base to qualify (default 10%)."""
+
+    ibc_base_volume_decay: float = field(
+        default_factory=lambda: _get_float("IBC_BASE_VOLUME_DECAY", 0.6)
+    )
+    """Maximum ratio of base avg volume / impulse avg volume (default 0.6)."""
+
+    ibc_monitor_cron: str = field(
+        default_factory=lambda: _get("IBC_MONITOR_CRON", "*/30 * * * *")
+    )
+    """Cron for Phase 2 base monitor (default every 30 minutes)."""
+
+    # ---- Phase 3: Breakout detection --------------------------------
+    ibc_breakout_confirm_pct: float = field(
+        default_factory=lambda: _get_float("IBC_BREAKOUT_CONFIRM_PCT", 0.3)
+    )
+    """Close must be ≥ this % beyond level to confirm breakout (default 0.3%)."""
+
+    ibc_breakout_vol_mult: float = field(
+        default_factory=lambda: _get_float("IBC_BREAKOUT_VOL_MULT", 1.3)
+    )
+    """Breakout volume must be ≥ avg × this multiplier (default 1.3×)."""
+
+    ibc_breakout_cron: str = field(
+        default_factory=lambda: _get("IBC_BREAKOUT_CRON", "*/15 * * * *")
+    )
+    """Cron for Phase 3 breakout polling (default every 15 minutes)."""
+
+    # ---- Deduplication / TTL ----------------------------------------
+    ibc_cooldown_h: float = field(
+        default_factory=lambda: _get_float("IBC_COOLDOWN_H", 24.0)
+    )
+    """Hours before the same setup can trigger another breakout alert (default 24h)."""
+
+    ibc_watchlist_ttl_hours: float = field(
+        default_factory=lambda: _get_float("IBC_WATCHLIST_TTL_HOURS", 168.0)
+    )
+    """Hours before an IBC watchlist entry expires without breakout (default 168h / 7d)."""
 
     def validate(self) -> None:
         """Raise ValueError for critical missing config."""

@@ -2,6 +2,11 @@
 SQLAlchemy ORM table definitions.
 
 Uses SQLAlchemy 2.0 mapped_column / DeclarativeBase.
+
+ADDITIVE CHANGES:
+  - ImpulseEventRow     — Phase 1 detected impulse events
+  - IBCWatchlistRow     — Active IBC watchlist entries (Phases 2–3)
+  - IBCBreakoutEventRow — Confirmed IBC breakout events (Phase 3)
 """
 
 from __future__ import annotations
@@ -132,3 +137,103 @@ class HealthCheckLogRow(Base):
     last_4h_scan: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_1h_scan: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     details: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+# ---------------------------------------------------------------------------
+# IBC tables (additive — no existing table modified)
+# ---------------------------------------------------------------------------
+
+
+class ImpulseEventRow(Base):
+    """Persisted Phase 1 impulse detections."""
+
+    __tablename__ = "ibc_impulse_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    start_price: Mapped[float] = mapped_column(Float, nullable=False)
+    end_price: Mapped[float] = mapped_column(Float, nullable=False)
+    move_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    bar_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    avg_impulse_volume: Mapped[float] = mapped_column(Float, nullable=False)
+    avg_20_volume: Mapped[float] = mapped_column(Float, nullable=False)
+    rv_impulse: Mapped[float] = mapped_column(Float, nullable=False)
+    atr14: Mapped[float] = mapped_column(Float, nullable=False)
+    atr_multiple: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class IBCWatchlistRow(Base):
+    """Active IBC watchlist entries spanning Phases 2–3."""
+
+    __tablename__ = "ibc_watchlist"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    impulse_event_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    # Impulse reference
+    impulse_start_price: Mapped[float] = mapped_column(Float, nullable=False)
+    impulse_end_price: Mapped[float] = mapped_column(Float, nullable=False)
+    impulse_move_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    impulse_rv: Mapped[float] = mapped_column(Float, nullable=False)
+    impulse_atr_multiple: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Level (nullable until base confirmed)
+    level_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    level_touches: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    level_cluster_high: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    level_cluster_low: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Consolidation
+    base_range_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    base_candle_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    base_avg_volume: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Breakout
+    breakout_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    breakout_volume_confirmed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="impulse_detected")
+    base_alert_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_breakout_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class IBCBreakoutEventRow(Base):
+    """Confirmed IBC Phase 3 breakout events."""
+
+    __tablename__ = "ibc_breakout_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    watchlist_entry_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    breakout_price: Mapped[float] = mapped_column(Float, nullable=False)
+    level_price: Mapped[float] = mapped_column(Float, nullable=False)
+    distance_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    volume_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    breakout_volume: Mapped[float] = mapped_column(Float, nullable=False)
+    avg_volume: Mapped[float] = mapped_column(Float, nullable=False)
+
+    impulse_move_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    impulse_rv: Mapped[float] = mapped_column(Float, nullable=False)
+    impulse_atr_multiple: Mapped[float] = mapped_column(Float, nullable=False)
+    level_touches: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_range_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    base_volume_decay: Mapped[float] = mapped_column(Float, nullable=False)
+
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    chart_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False, default="")
